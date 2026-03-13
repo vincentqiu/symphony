@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, BudgetGuard, Config, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -132,6 +132,7 @@ defmodule SymphonyElixir.Orchestrator do
         state =
           case reason do
             :normal ->
+              _ = BudgetGuard.reset_failures(running_entry.issue)
               Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
 
               state
@@ -144,16 +145,26 @@ defmodule SymphonyElixir.Orchestrator do
               })
 
             _ ->
+              budget = Config.settings!().budget
               Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
 
-              next_attempt = next_retry_attempt_from_running(running_entry)
-
-              schedule_issue_retry(state, issue_id, next_attempt, %{
+              failure_metadata = %{
                 identifier: running_entry.identifier,
                 error: "agent exited: #{inspect(reason)}",
                 worker_host: Map.get(running_entry, :worker_host),
                 workspace_path: Map.get(running_entry, :workspace_path)
-              })
+              }
+
+              should_count_failure? = Map.get(running_entry, :failure_recorded, false) != true
+
+              case maybe_block_for_failures(state, running_entry, budget, should_count_failure?) do
+                {:blocked, blocked_state} ->
+                  blocked_state
+
+                :ok ->
+                  next_attempt = next_retry_attempt_from_running(running_entry)
+                  schedule_issue_retry(state, issue_id, next_attempt, failure_metadata)
+              end
           end
 
         Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
@@ -190,14 +201,57 @@ defmodule SymphonyElixir.Orchestrator do
 
       running_entry ->
         {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
+        failure_event? = codex_failure_event?(update)
+        already_recorded_failure? = Map.get(running_entry, :failure_recorded, false) == true
+
+        updated_running_entry =
+          if failure_event? do
+            Map.put(updated_running_entry, :failure_recorded, true)
+          else
+            updated_running_entry
+          end
+
+        budget = Config.settings!().budget
+
+        _ =
+          if BudgetGuard.enabled?(budget) do
+            BudgetGuard.record_usage(updated_running_entry.issue, token_delta, budget)
+          else
+            :ok
+          end
 
         state =
           state
           |> apply_codex_token_delta(token_delta)
           |> apply_codex_rate_limits(update)
+          |> Map.put(:running, Map.put(running, issue_id, updated_running_entry))
+
+        state =
+          if failure_event? and not already_recorded_failure? do
+            case maybe_block_for_failures(state, %{issue: updated_running_entry.issue}, budget) do
+              {:blocked, blocked_state} ->
+                terminate_running_issue(blocked_state, issue_id, false)
+
+              :ok ->
+                state
+            end
+          else
+            state
+          end
+
+        state =
+          case budget_check(updated_running_entry.issue, budget) do
+            :ok ->
+              state
+
+            {:blocked, snapshot} ->
+              Logger.warning("Budget guard halted active run for #{issue_context(updated_running_entry.issue)} reason=#{inspect(snapshot.reason)}")
+              state = block_issue_for_budget(state, updated_running_entry.issue, snapshot, budget)
+              terminate_running_issue(state, issue_id, false)
+          end
 
         notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+        {:noreply, state}
     end
   end
 
@@ -678,6 +732,19 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
+    budget = Config.settings!().budget
+
+    case budget_check(issue, budget) do
+      :ok ->
+        do_dispatch_issue_with_capacity(state, issue, attempt, preferred_worker_host)
+
+      {:blocked, snapshot} ->
+        Logger.warning("Budget guard blocked dispatch for #{issue_context(issue)} reason=#{inspect(snapshot.reason)}")
+        block_issue_for_budget(state, issue, snapshot, budget)
+    end
+  end
+
+  defp do_dispatch_issue_with_capacity(%State{} = state, issue, attempt, preferred_worker_host) do
     recipient = self()
 
     case select_worker_host(state, preferred_worker_host) do
@@ -718,6 +785,7 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_input_tokens: 0,
             codex_last_reported_output_tokens: 0,
             codex_last_reported_total_tokens: 0,
+            failure_recorded: false,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
             started_at: DateTime.utc_now()
@@ -848,6 +916,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp handle_retry_issue_lookup(%Issue{} = issue, state, issue_id, attempt, metadata) do
     terminal_states = terminal_state_set()
+    budget = Config.settings!().budget
+    budget_result = budget_check(issue, budget)
 
     cond do
       terminal_issue_state?(issue.state, terminal_states) ->
@@ -855,6 +925,11 @@ defmodule SymphonyElixir.Orchestrator do
 
         cleanup_issue_workspace(issue.identifier, metadata[:worker_host])
         {:noreply, release_issue_claim(state, issue_id)}
+
+      match?({:blocked, _}, budget_result) ->
+        {:blocked, snapshot} = budget_result
+        Logger.warning("Budget guard blocked retry for #{issue_context(issue)} reason=#{inspect(snapshot.reason)}")
+        {:noreply, block_issue_for_budget(state, issue, snapshot, budget)}
 
       retry_candidate_issue?(issue, terminal_states) ->
         handle_active_retry(state, issue, attempt, metadata)
@@ -920,6 +995,130 @@ defmodule SymphonyElixir.Orchestrator do
        )}
     end
   end
+
+  defp budget_check(%Issue{} = issue, budget) do
+    if BudgetGuard.enabled?(budget) do
+      BudgetGuard.check_issue(issue, budget)
+    else
+      :ok
+    end
+  end
+
+  defp budget_check(_issue, _budget), do: :ok
+
+  defp block_issue_for_budget(%State{} = state, %Issue{} = issue, snapshot, budget) do
+    if comment_every_block?(budget) do
+      maybe_move_issue_to_budget_state(issue, budget)
+      maybe_comment_budget_block(issue, snapshot, budget)
+    else
+      case BudgetGuard.mark_block_notified(issue, snapshot.reason) do
+        :new ->
+          maybe_move_issue_to_budget_state(issue, budget)
+          maybe_comment_budget_block(issue, snapshot, budget)
+
+        :seen ->
+          Logger.debug("Budget guard skip duplicate blocker actions for #{issue_context(issue)} reason=#{inspect(snapshot.reason)}")
+      end
+    end
+
+    state
+    |> cancel_retry_attempt(issue.id)
+    |> release_issue_claim(issue.id)
+  end
+
+  defp comment_every_block?(budget) do
+    budget
+    |> Map.get(:on_limit, %{})
+    |> Map.get(:comment_every_block, false)
+    |> Kernel.==(true)
+  end
+
+  defp maybe_move_issue_to_budget_state(%Issue{id: issue_id} = issue, budget) when is_binary(issue_id) do
+    move_state = budget_move_state(budget)
+
+    case Tracker.update_issue_state(issue_id, move_state) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Budget guard failed to move #{issue_context(issue)} to #{inspect(move_state)}: #{inspect(reason)}")
+    end
+  end
+
+  defp maybe_move_issue_to_budget_state(_issue, _budget), do: :ok
+
+  defp maybe_comment_budget_block(%Issue{id: issue_id} = issue, snapshot, budget) when is_binary(issue_id) do
+    body = BudgetGuard.block_comment(issue, snapshot, budget)
+
+    case Tracker.create_comment(issue_id, body) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Budget guard failed to comment on #{issue_context(issue)}: #{inspect(reason)}")
+    end
+  end
+
+  defp maybe_comment_budget_block(_issue, _snapshot, _budget), do: :ok
+
+  defp budget_move_state(budget) do
+    budget
+    |> Map.get(:on_limit, %{})
+    |> Map.get(:move_state, "Human Review")
+    |> case do
+      value when is_binary(value) ->
+        trimmed = String.trim(value)
+        if trimmed == "", do: "Human Review", else: trimmed
+
+      _ ->
+        "Human Review"
+    end
+  end
+
+  defp cancel_retry_attempt(%State{} = state, issue_id) when is_binary(issue_id) do
+    case Map.get(state.retry_attempts, issue_id) do
+      %{timer_ref: timer_ref} when is_reference(timer_ref) ->
+        Process.cancel_timer(timer_ref)
+        %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}
+
+      %{} ->
+        %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}
+
+      _ ->
+        state
+    end
+  end
+
+  defp cancel_retry_attempt(%State{} = state, _issue_id), do: state
+
+  defp maybe_block_for_failures(state, running_entry, budget, should_count? \\ true)
+
+  defp maybe_block_for_failures(%State{} = state, %{issue: %Issue{} = issue}, budget, should_count?) do
+    if BudgetGuard.enabled?(budget) do
+      if should_count? do
+        case BudgetGuard.record_failure(issue, budget) do
+          {:blocked, snapshot} ->
+            Logger.warning("Budget guard blocked retries after failures for #{issue_context(issue)} reason=#{inspect(snapshot.reason)}")
+            {:blocked, block_issue_for_budget(state, issue, snapshot, budget)}
+
+          :ok ->
+            :ok
+        end
+      else
+        :ok
+      end
+    else
+      :ok
+    end
+  end
+
+  defp maybe_block_for_failures(_state, _running_entry, _budget, _should_count?), do: :ok
+
+  defp codex_failure_event?(%{event: event})
+       when event in [:turn_ended_with_error, :startup_failed, :turn_failed, :turn_cancelled],
+       do: true
+
+  defp codex_failure_event?(_update), do: false
 
   defp release_issue_claim(%State{} = state, issue_id) do
     %{state | claimed: MapSet.delete(state.claimed, issue_id)}

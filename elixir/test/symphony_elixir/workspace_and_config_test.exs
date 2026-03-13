@@ -1046,6 +1046,35 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert settings.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
   end
 
+  test "schema parses budget guard settings and normalizes defaults" do
+    assert {:ok, settings} =
+             Schema.parse(%{
+               budget: %{
+                 currency: " usd ",
+                 store_path: " /tmp/budget-guard.dets ",
+                 daily_usd_limit: 5.0,
+                 per_issue_usd_limit: 0.5,
+                 consecutive_fail_limit: 3,
+                 fail_cooldown_minutes: 60,
+                 on_limit: %{
+                   move_state: " Human Review ",
+                   comment_prefix: " [Budget Guard] ",
+                   comment_every_block: true
+                 }
+               }
+             })
+
+    assert settings.budget.currency == "USD"
+    assert settings.budget.store_path == "/tmp/budget-guard.dets"
+    assert settings.budget.daily_usd_limit == 5.0
+    assert settings.budget.per_issue_usd_limit == 0.5
+    assert settings.budget.consecutive_fail_limit == 3
+    assert settings.budget.fail_cooldown_minutes == 60
+    assert settings.budget.on_limit.move_state == "Human Review"
+    assert settings.budget.on_limit.comment_prefix == "[Budget Guard]"
+    assert settings.budget.on_limit.comment_every_block == true
+  end
+
   test "schema resolves sandbox policies from explicit and default workspaces" do
     explicit_policy = %{"type" => "workspaceWrite", "writableRoots" => ["/tmp/explicit"]}
 

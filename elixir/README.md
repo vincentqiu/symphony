@@ -121,6 +121,8 @@ Notes:
   Symphony validation.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
+- Optional `budget` guardrails can enforce per-issue and daily token/cost limits. When a limit is
+  reached, Symphony can move the issue to a review state and stop retries.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
@@ -150,6 +152,53 @@ codex:
   reload error until the file is fixed.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
   `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
+
+Budget guard example:
+
+```yaml
+budget:
+  currency: USD
+  daily_usd_limit: 5.0
+  per_issue_usd_limit: 0.5
+  usd_per_1m_input: 1.75
+  usd_per_1m_output: 14.0
+  consecutive_fail_limit: 3
+  fail_cooldown_minutes: 60
+  store_path: ~/.symphony/budget_guard.dets
+  on_limit:
+    move_state: Human Review
+    comment_prefix: "[Budget Guard]"
+    comment_every_block: false
+```
+
+Recommended production starting defaults:
+
+```yaml
+budget:
+  currency: USD
+  store_path: ~/.symphony/budget_guard.dets
+  daily_usd_limit: 10.0
+  daily_input_tokens_limit: 3000000
+  daily_output_tokens_limit: 300000
+  per_issue_usd_limit: 1.0
+  per_issue_input_tokens_limit: 400000
+  per_issue_output_tokens_limit: 40000
+  usd_per_1m_input: 1.75
+  usd_per_1m_output: 14.0
+  consecutive_fail_limit: 3
+  fail_cooldown_minutes: 60
+  on_limit:
+    move_state: Human Review
+    comment_prefix: "[Budget Guard]"
+    comment_every_block: false
+```
+
+Quick tuning guidance:
+
+- Set `per_issue_usd_limit` to about `1.2x` your acceptable single-ticket cost.
+- Set `daily_usd_limit` to about `1.5x` your typical daily spend.
+- Keep `consecutive_fail_limit` in the `2-3` range.
+- Keep `comment_every_block: false` in production to avoid noisy issue timelines.
 
 ## Web dashboard
 
