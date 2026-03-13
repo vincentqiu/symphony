@@ -105,6 +105,28 @@ defmodule SymphonyElixir.BudgetGuardTest do
     assert :new = BudgetGuard.mark_block_notified(issue, :per_issue_usd_limit)
   end
 
+  test "report returns daily and per-issue usage" do
+    issue = %Issue{id: "issue-6", identifier: "MT-6", state: "In Progress"}
+
+    budget = %Schema.Budget{
+      daily_usd_limit: 10.0,
+      usd_per_1m_input: 1.0,
+      usd_per_1m_output: 1.0,
+      on_limit: %Schema.BudgetOnLimit{}
+    }
+
+    assert :ok = BudgetGuard.record_usage(issue, %{input_tokens: 1_000, output_tokens: 500}, budget)
+
+    report = BudgetGuard.report(date: Date.utc_today(), issue_id: "issue-6")
+    assert report.daily.total_tokens == 1_500
+    assert report.issue_day.total_tokens == 1_500
+    assert report.issue_total.total_tokens == 1_500
+
+    top_report = BudgetGuard.report(date: Date.utc_today(), top_n: 5)
+    assert is_list(top_report.top_issues)
+    assert Enum.any?(top_report.top_issues, &(&1.issue_id == "issue-6"))
+  end
+
   defp close_dets_if_possible do
     case :dets.close(:symphony_budget_guard_dets) do
       :ok -> :ok

@@ -174,6 +174,54 @@ defmodule SymphonyElixir.BudgetGuard do
 
   def mark_block_notified(_issue_id, _reason), do: :new
 
+  @spec report(keyword()) :: map()
+  def report(opts \\ []) do
+    ensure_storage!()
+    date = Keyword.get(opts, :date, Date.utc_today())
+    issue_id = Keyword.get(opts, :issue_id)
+    top_n = max(Keyword.get(opts, :top_n, 20), 1)
+
+    currency =
+      try do
+        normalize_currency(Config.settings!().budget.currency)
+      rescue
+        _ -> "USD"
+      end
+
+    day = read_usage({:day, date})
+
+    base = %{
+      date: date,
+      currency: currency,
+      daily: usage_with_usd(day)
+    }
+
+    if is_binary(issue_id) and String.trim(issue_id) != "" do
+      issue_day = read_usage({:issue_day, date, issue_id})
+      issue_total = read_usage({:issue_total, issue_id})
+      fail = read_fail(issue_id)
+
+      Map.merge(base, %{
+        issue_id: issue_id,
+        issue_day: usage_with_usd(issue_day),
+        issue_total: usage_with_usd(issue_total),
+        fail: %{
+          count: Map.get(fail, :count, 0),
+          cooling_until: Map.get(fail, :cooling_until)
+        }
+      })
+    else
+      issues =
+        date
+        |> issue_day_rows()
+        |> Enum.sort_by(fn row -> {-row.usd_micros, -row.total_tokens, row.issue_id} end)
+        |> Enum.take(top_n)
+        |> Enum.map(&usage_with_usd/1)
+
+      Map.put(base, :top_issues, issues)
+    end
+  end
+
   @spec block_comment(Issue.t(), map(), term()) :: String.t()
   def block_comment(%Issue{} = issue, snapshot, budget) do
     prefix = comment_prefix(budget)
@@ -338,6 +386,30 @@ defmodule SymphonyElixir.BudgetGuard do
     end
   end
 
+  defp issue_day_rows(%Date{} = date) do
+    :ets.foldl(
+      fn
+        {{:issue_day, ^date, issue_id}, input_tokens, output_tokens, usd_micros}, acc ->
+          usage = %{
+            issue_id: issue_id,
+            input_tokens: non_negative_int(input_tokens),
+            output_tokens: non_negative_int(output_tokens),
+            total_tokens: non_negative_int(input_tokens) + non_negative_int(output_tokens),
+            usd_micros: non_negative_int(usd_micros)
+          }
+
+          [usage | acc]
+
+        _record, acc ->
+          acc
+      end,
+      [],
+      @table
+    )
+  end
+
+  defp issue_day_rows(_date), do: []
+
   defp read_fail(issue_id) when is_binary(issue_id) do
     key = {:fail, issue_id}
 
@@ -499,6 +571,19 @@ defmodule SymphonyElixir.BudgetGuard do
   end
 
   defp format_usd(_usage, currency), do: "#{currency} 0.0000"
+
+  defp usage_with_usd(usage) when is_map(usage) do
+    usd_micros = Map.get(usage, :usd_micros, 0)
+
+    usage
+    |> Map.put(:input_tokens, Map.get(usage, :input_tokens, 0))
+    |> Map.put(:output_tokens, Map.get(usage, :output_tokens, 0))
+    |> Map.put(:total_tokens, Map.get(usage, :total_tokens, Map.get(usage, :input_tokens, 0) + Map.get(usage, :output_tokens, 0)))
+    |> Map.put(:usd_micros, usd_micros)
+    |> Map.put(:usd, usd_micros / @micros_per_usd)
+  end
+
+  defp usage_with_usd(usage), do: usage
 
   defp format_limit(nil, _currency), do: "n/a"
 

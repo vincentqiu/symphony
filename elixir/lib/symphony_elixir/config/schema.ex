@@ -261,6 +261,82 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule BudgetOnLimit do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:move_state, :string, default: "Human Review")
+      field(:comment_prefix, :string, default: "[Budget Guard]")
+      field(:comment_every_block, :boolean, default: false)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:move_state, :comment_prefix, :comment_every_block], empty_values: [])
+    end
+  end
+
+  defmodule Budget do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:currency, :string, default: "USD")
+      field(:store_path, :string)
+      field(:daily_usd_limit, :float)
+      field(:daily_input_tokens_limit, :integer)
+      field(:daily_output_tokens_limit, :integer)
+      field(:per_issue_usd_limit, :float)
+      field(:per_issue_input_tokens_limit, :integer)
+      field(:per_issue_output_tokens_limit, :integer)
+      field(:usd_per_1m_input, :float, default: 1.75)
+      field(:usd_per_1m_output, :float, default: 14.0)
+      field(:consecutive_fail_limit, :integer)
+      field(:fail_cooldown_minutes, :integer, default: 60)
+      embeds_one(:on_limit, BudgetOnLimit, on_replace: :update, defaults_to_struct: true)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(
+        attrs,
+        [
+          :currency,
+          :store_path,
+          :daily_usd_limit,
+          :daily_input_tokens_limit,
+          :daily_output_tokens_limit,
+          :per_issue_usd_limit,
+          :per_issue_input_tokens_limit,
+          :per_issue_output_tokens_limit,
+          :usd_per_1m_input,
+          :usd_per_1m_output,
+          :consecutive_fail_limit,
+          :fail_cooldown_minutes
+        ],
+        empty_values: []
+      )
+      |> cast_embed(:on_limit, with: &BudgetOnLimit.changeset/2)
+      |> validate_number(:daily_usd_limit, greater_than: 0)
+      |> validate_number(:daily_input_tokens_limit, greater_than: 0)
+      |> validate_number(:daily_output_tokens_limit, greater_than: 0)
+      |> validate_number(:per_issue_usd_limit, greater_than: 0)
+      |> validate_number(:per_issue_input_tokens_limit, greater_than: 0)
+      |> validate_number(:per_issue_output_tokens_limit, greater_than: 0)
+      |> validate_number(:usd_per_1m_input, greater_than_or_equal_to: 0)
+      |> validate_number(:usd_per_1m_output, greater_than_or_equal_to: 0)
+      |> validate_number(:consecutive_fail_limit, greater_than: 0)
+      |> validate_number(:fail_cooldown_minutes, greater_than_or_equal_to: 0)
+    end
+  end
+
   embedded_schema do
     embeds_one(:tracker, Tracker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:polling, Polling, on_replace: :update, defaults_to_struct: true)
@@ -271,6 +347,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:budget, Budget, on_replace: :update, defaults_to_struct: true)
   end
 
   @spec parse(map()) :: {:ok, %__MODULE__{}} | {:error, {:invalid_workflow_config, String.t()}}
@@ -363,6 +440,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
+    |> cast_embed(:budget, with: &Budget.changeset/2)
   end
 
   defp finalize_settings(settings) do
@@ -383,8 +461,54 @@ defmodule SymphonyElixir.Config.Schema do
         turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
     }
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex}
+    budget = normalize_budget(settings.budget)
+
+    %{settings | tracker: tracker, workspace: workspace, codex: codex, budget: budget}
   end
+
+  defp normalize_budget(%Budget{} = budget) do
+    %{
+      budget
+      | currency: normalize_currency(budget.currency),
+        store_path: normalize_optional_non_empty_string(budget.store_path),
+        on_limit: normalize_budget_on_limit(budget.on_limit)
+    }
+  end
+
+  defp normalize_budget(other), do: other
+
+  defp normalize_budget_on_limit(%BudgetOnLimit{} = on_limit) do
+    %{
+      on_limit
+      | move_state: normalize_non_empty_string(on_limit.move_state, "Human Review"),
+        comment_prefix: normalize_non_empty_string(on_limit.comment_prefix, "[Budget Guard]")
+    }
+  end
+
+  defp normalize_budget_on_limit(other), do: other
+
+  defp normalize_currency(currency) when is_binary(currency) do
+    currency
+    |> String.trim()
+    |> String.upcase()
+    |> normalize_non_empty_string("USD")
+  end
+
+  defp normalize_currency(_currency), do: "USD"
+
+  defp normalize_non_empty_string(value, default) when is_binary(value) do
+    trimmed = String.trim(value)
+    if trimmed == "", do: default, else: trimmed
+  end
+
+  defp normalize_non_empty_string(_value, default), do: default
+
+  defp normalize_optional_non_empty_string(value) when is_binary(value) do
+    trimmed = String.trim(value)
+    if trimmed == "", do: nil, else: trimmed
+  end
+
+  defp normalize_optional_non_empty_string(_value), do: nil
 
   defp normalize_keys(value) when is_map(value) do
     Enum.reduce(value, %{}, fn {key, raw_value}, normalized ->
